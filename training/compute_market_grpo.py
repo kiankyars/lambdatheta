@@ -48,6 +48,7 @@ def observation_to_prompt(observation: Any, task_prompt: str = DEFAULT_TASK_PROM
     return json.dumps(
         {
             "task": task_prompt,
+            "scenario_variant": getattr(observation, "scenario_variant", "baseline"),
             "tick": observation.current_tick,
             "max_ticks": observation.max_ticks,
             "budget_remaining": observation.budget_remaining,

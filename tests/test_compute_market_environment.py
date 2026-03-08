@@ -45,3 +45,19 @@ def test_invalid_action_returns_penalty_metadata():
 
     assert result.reward < 0
     assert "error" in result.metadata
+
+
+def test_tight_capacity_variant_changes_capacity():
+    env = ComputeMarketEnvironment(total_gpus=8, default_seed=0)
+    result = env.reset(seed=7, scenario_variant="tight_capacity")
+
+    assert result.scenario_variant == "tight_capacity"
+    assert result.total_gpus == 6
+
+
+def test_policy_shift_variant_removes_broker_offer():
+    env = ComputeMarketEnvironment(default_seed=0)
+    result = env.reset(seed=7, scenario_variant="policy_shift")
+
+    assert result.scenario_variant == "policy_shift"
+    assert all(offer.actor_id != "broker-1" for offer in result.visible_offers)

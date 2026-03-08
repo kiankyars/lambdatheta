@@ -51,14 +51,21 @@ class ComputeMarketEnvironment(
         max_ticks: int = 12,
         default_seed: int = 0,
     ) -> None:
+        self.base_total_gpus = total_gpus
+        self.base_initial_budget = initial_budget
+        self.base_max_ticks = max_ticks
         self.total_gpus = total_gpus
         self.initial_budget = initial_budget
         self.max_ticks = max_ticks
         self.default_seed = default_seed
+        self._scenario_variant = "baseline"
+        self._price_bias = 0.0
+        self._broker_enabled = True
         self._state = ComputeMarketState(
             episode_id=str(uuid4()),
             step_count=0,
             scenario_seed=default_seed,
+            scenario_variant="baseline",
             max_ticks=max_ticks,
             total_gpus=total_gpus,
             budget_remaining=initial_budget,
@@ -85,6 +92,7 @@ class ComputeMarketEnvironment(
         **kwargs,
     ) -> ComputeMarketObservation:
         scenario_seed = self.default_seed if seed is None else seed
+        self._apply_scenario_variant(kwargs.get("scenario_variant", "baseline"))
         self._rng = random.Random(scenario_seed)
         self._current_tick = 0
         self._done = False
@@ -99,7 +107,7 @@ class ComputeMarketEnvironment(
             MarketEvent(
                 tick=0,
                 event_type="reset",
-                message="Scenario initialized with scripted tenants and broker.",
+                message=f"Scenario '{self._scenario_variant}' initialized with scripted counterparties.",
             )
         ]
         self._refresh_market()
@@ -108,7 +116,11 @@ class ComputeMarketEnvironment(
             step_count=0,
             scenario_seed=scenario_seed,
         )
-        return self._build_observation(0.0, False, {"status": "ready"})
+        return self._build_observation(
+            0.0,
+            False,
+            {"status": "ready", "scenario_variant": self._scenario_variant},
+        )
 
     def step(self, action: ComputeMarketAction) -> ComputeMarketObservation:  # type: ignore[override]
         if self._done:
@@ -157,7 +169,10 @@ class ComputeMarketEnvironment(
             step_count=self._state.step_count,
             scenario_seed=self._state.scenario_seed,
         )
-        metadata = {"events": [event.model_dump() for event in combined_events]}
+        metadata = {
+            "events": [event.model_dump() for event in combined_events],
+            "scenario_variant": self._scenario_variant,
+        }
         if error:
             metadata["error"] = error
         return self._build_observation(total_reward, self._done, metadata)
@@ -166,8 +181,64 @@ class ComputeMarketEnvironment(
     def state(self) -> ComputeMarketState:
         return self._state
 
+    def _apply_scenario_variant(self, variant: str) -> None:
+        allowed = {
+            "baseline",
+            "tight_capacity",
+            "price_shock",
+            "policy_shift",
+            "job_mix",
+        }
+        self._scenario_variant = variant if variant in allowed else "baseline"
+        self.total_gpus = self.base_total_gpus
+        self.initial_budget = self.base_initial_budget
+        self.max_ticks = self.base_max_ticks
+        self._price_bias = 0.0
+        self._broker_enabled = True
+
+        if self._scenario_variant == "tight_capacity":
+            self.total_gpus = max(4, self.base_total_gpus - 2)
+        elif self._scenario_variant == "price_shock":
+            self._price_bias = 2.25
+        elif self._scenario_variant == "policy_shift":
+            self._broker_enabled = False
+        elif self._scenario_variant == "job_mix":
+            self.max_ticks = self.base_max_ticks + 1
+
     def _build_jobs(self) -> list[JobRecord]:
         jitter = self._rng.randint(-4, 4)
+        if self._scenario_variant == "job_mix":
+            return [
+                JobRecord(
+                    job_id="job-a",
+                    gpu_count=3,
+                    total_duration=3,
+                    remaining_duration=3,
+                    deadline=6,
+                    value=82 + jitter,
+                    priority=2,
+                ),
+                JobRecord(
+                    job_id="job-b",
+                    gpu_count=2,
+                    total_duration=1,
+                    remaining_duration=1,
+                    deadline=4,
+                    value=36 + self._rng.randint(-2, 2),
+                    priority=3,
+                ),
+                JobRecord(
+                    job_id="job-c",
+                    gpu_count=3,
+                    total_duration=2,
+                    remaining_duration=2,
+                    deadline=8,
+                    value=58 + self._rng.randint(-3, 3),
+                    priority=2,
+                    depends_on=["job-b"],
+                ),
+            ]
+
         return [
             JobRecord(
                 job_id="job-a",
@@ -200,7 +271,7 @@ class ComputeMarketEnvironment(
         ]
 
     def _build_actors(self) -> list[ActorProfile]:
-        return [
+        actors = [
             ActorProfile(
                 actor_id="urgent-tenant",
                 policy_type="urgent_tenant",
@@ -226,6 +297,17 @@ class ComputeMarketEnvironment(
                 swap_floor=round(5.0 + self._rng.uniform(0.2, 0.8), 2),
             ),
         ]
+
+        if self._scenario_variant == "policy_shift":
+            actors[0].max_bid = round(max(3.5, actors[0].max_bid - 2.0), 2)
+            actors[0].visible_behavior = "steady"
+            actors[1].max_bid = round(actors[1].max_bid + 1.4, 2)
+            actors[1].preferred_gpu_count += 1
+            actors[1].visible_behavior = "aggressive"
+
+        if not self._broker_enabled:
+            actors = [actor for actor in actors if actor.policy_type != "broker"]
+        return actors
 
     def _handle_bid(self, action: ComputeMarketAction) -> tuple[float, str | None, list[MarketEvent]]:
         if action.gpu_count <= 0:
@@ -480,7 +562,7 @@ class ComputeMarketEnvironment(
     def _refresh_market(self) -> None:
         owned = self._owned_gpus()
         remaining_cluster = max(0, self.total_gpus - owned)
-        base_price = 4.0 + 0.3 * self._current_tick + self._rng.uniform(0.0, 1.0)
+        base_price = 4.0 + 0.3 * self._current_tick + self._rng.uniform(0.0, 1.0) + self._price_bias
         actor_signals: list[ActorSignal] = []
         visible_offers: list[MarketOffer] = []
         external_demand = 0
@@ -498,17 +580,21 @@ class ComputeMarketEnvironment(
                 gpu_demand = actor.preferred_gpu_count
                 bid = round(actor.max_bid + 0.2 * self._current_tick, 2)
                 pressure = "medium"
-                visible_offers.append(
-                    MarketOffer(
-                        offer_id=f"offer-{self._current_tick}-{actor.actor_id}",
-                        actor_id=actor.actor_id,
-                        gpu_count=min(remaining_cluster or actor.preferred_gpu_count, actor.preferred_gpu_count),
-                        price_per_gpu=round(bid + 0.6, 2),
-                        duration=2,
-                        expires_at_tick=self._current_tick + 1,
-                        offer_type="broker",
+                if self._broker_enabled:
+                    visible_offers.append(
+                        MarketOffer(
+                            offer_id=f"offer-{self._current_tick}-{actor.actor_id}",
+                            actor_id=actor.actor_id,
+                            gpu_count=min(
+                                remaining_cluster or actor.preferred_gpu_count,
+                                actor.preferred_gpu_count,
+                            ),
+                            price_per_gpu=round(bid + 0.6, 2),
+                            duration=2,
+                            expires_at_tick=self._current_tick + 1,
+                            offer_type="broker",
+                        )
                     )
-                )
 
             if actor.policy_type != "broker":
                 external_demand += gpu_demand
@@ -563,6 +649,7 @@ class ComputeMarketEnvironment(
             episode_id=episode_id,
             step_count=step_count,
             scenario_seed=scenario_seed,
+            scenario_variant=self._scenario_variant,
             current_tick=self._current_tick,
             max_ticks=self.max_ticks,
             total_gpus=self.total_gpus,
@@ -589,6 +676,7 @@ class ComputeMarketEnvironment(
         metadata: dict,
     ) -> ComputeMarketObservation:
         return ComputeMarketObservation(
+            scenario_variant=self._scenario_variant,
             current_tick=self._current_tick,
             max_ticks=self.max_ticks,
             total_gpus=self.total_gpus,

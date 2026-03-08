@@ -31,6 +31,7 @@ class ComputeMarketEnv(
     def _parse_result(self, payload: dict[str, Any]) -> StepResult[ComputeMarketObservation]:
         obs_data = payload.get("observation", {})
         observation = ComputeMarketObservation(
+            scenario_variant=obs_data.get("scenario_variant", "baseline"),
             current_tick=obs_data.get("current_tick", 0),
             max_ticks=obs_data.get("max_ticks", 0),
             total_gpus=obs_data.get("total_gpus", 0),
@@ -58,6 +59,7 @@ class ComputeMarketEnv(
             episode_id=payload.get("episode_id", ""),
             step_count=payload.get("step_count", 0),
             scenario_seed=payload.get("scenario_seed", 0),
+            scenario_variant=payload.get("scenario_variant", "baseline"),
             current_tick=payload.get("current_tick", 0),
             max_ticks=payload.get("max_ticks", 0),
             total_gpus=payload.get("total_gpus", 0),

@@ -99,6 +99,7 @@ class ComputeMarketAction(Action):
 class ComputeMarketObservation(Observation):
     """Partial observation exposed to the trained agent."""
 
+    scenario_variant: str = "baseline"
     current_tick: int = Field(default=0, ge=0)
     max_ticks: int = Field(default=0, ge=0)
     total_gpus: int = Field(default=0, ge=0)
@@ -117,6 +118,7 @@ class ComputeMarketState(State):
     """Full control-plane state including hidden actor data."""
 
     scenario_seed: int = 0
+    scenario_variant: str = "baseline"
     current_tick: int = 0
     max_ticks: int = 0
     total_gpus: int = 0

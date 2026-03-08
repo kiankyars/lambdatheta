@@ -73,11 +73,3 @@ docker run -p 8000:8000 compute-market-env:latest
 4. Scripted actors update demand and offers.
 5. Jobs progress, complete, pause, or miss deadlines.
 6. The environment returns the next observation and realized reward for that tick.
-
-## Training
-
-For a minimal Colab/TRL integration, use `training/minimal_grpo_rollout.py` and start from a small model notebook such as Qwen 4B or Llama 3.2 3B. The helper script is designed to be pasted into a Colab notebook and wired into GRPO rollouts.
-
-## Oversight
-
-Scalable oversight is intentionally not joint-trained in v1. The recommended phase 2 is to log trajectories from this environment and train a separate auditor on replayed episodes.
