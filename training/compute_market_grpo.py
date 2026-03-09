@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -38,6 +39,55 @@ class RolloutSummary:
     valid_action_reward: float
     completion_bonus: float
     transcripts: list[dict[str, Any]]
+
+
+@dataclass
+class SingleRolloutDebug:
+    seed: int | None
+    scenario_variant: str
+    episode_return: float
+    valid_action_count: int
+    invalid_action_count: int
+    final_done: bool
+    turns: list[dict[str, Any]]
+
+
+@dataclass
+class LocalStepResult:
+    observation: Any
+    reward: float
+    done: bool
+
+
+class LocalComputeMarketEnvAdapter:
+    """Adapter so local env matches the remote client surface used by rollouts."""
+
+    def __init__(self) -> None:
+        from compute_market_env.server.compute_market_environment import ComputeMarketEnvironment
+
+        self._env = ComputeMarketEnvironment()
+
+    def __enter__(self) -> "LocalComputeMarketEnvAdapter":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        return None
+
+    def reset(self, seed: int | None = None, **kwargs: Any) -> LocalStepResult:
+        observation = self._env.reset(seed=seed, **kwargs)
+        return LocalStepResult(
+            observation=observation,
+            reward=float(getattr(observation, "reward", 0.0) or 0.0),
+            done=bool(getattr(observation, "done", False)),
+        )
+
+    def step(self, action: ComputeMarketAction) -> LocalStepResult:
+        observation = self._env.step(action)
+        return LocalStepResult(
+            observation=observation,
+            reward=float(getattr(observation, "reward", 0.0) or 0.0),
+            done=bool(getattr(observation, "done", False)),
+        )
 
 
 def observation_to_prompt(observation: Any, task_prompt: str = DEFAULT_TASK_PROMPT) -> str:
@@ -69,6 +119,163 @@ def parse_action(text: str) -> tuple[ComputeMarketAction, bool]:
     match = ACTION_JSON_RE.search(text)
     if not match:
         return ComputeMarketAction(action_type="inspect_market"), False
+
+
+def _render_prompt(tokenizer: Any, prompt_text: str, system_prompt: str) -> tuple[list[dict[str, str]], str]:
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": prompt_text},
+    ]
+    rendered_prompt = tokenizer.apply_chat_template(
+        messages,
+        add_generation_prompt=True,
+        tokenize=False,
+        enable_thinking=False,
+    )
+    return messages, rendered_prompt
+
+
+def _generate_debug_completion(
+    model: Any,
+    tokenizer: Any,
+    rendered_prompt: str,
+    max_new_tokens: int = 64,
+    temperature: float = 0.0,
+    do_sample: bool = False,
+) -> str:
+    import torch
+
+    encoded = tokenizer(rendered_prompt, return_tensors="pt")
+    device = getattr(model, "device", None)
+    if device is not None:
+        encoded = {key: value.to(device) for key, value in encoded.items()}
+
+    generation_kwargs = dict(
+        max_new_tokens=max_new_tokens,
+        do_sample=do_sample,
+        pad_token_id=tokenizer.eos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+    )
+    if do_sample:
+        generation_kwargs["temperature"] = temperature
+
+    autocast_context = nullcontext()
+    if torch.cuda.is_available():
+        autocast_context = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+
+    with torch.inference_mode(), autocast_context:
+        outputs = model.generate(**encoded, **generation_kwargs)
+
+    generated_tokens = outputs[0][encoded["input_ids"].shape[1] :]
+    return tokenizer.decode(generated_tokens, skip_special_tokens=True)
+
+
+def _open_env(env_url: str | None = None) -> Any:
+    resolved = env_url or os.environ.get("OPENENV_URL", "http://localhost:8000")
+    if resolved == "local":
+        return LocalComputeMarketEnvAdapter()
+    return ComputeMarketEnv(base_url=resolved)
+
+
+def debug_single_rollout(
+    model: Any | None = None,
+    tokenizer: Any | None = None,
+    env_url: str | None = None,
+    dataset_prompt: str = DEFAULT_TASK_PROMPT,
+    system_prompt: str = SYSTEM_PROMPT,
+    max_turns: int = 6,
+    seed: int | None = 0,
+    scenario_variant: str = "baseline",
+    max_new_tokens: int = 64,
+    temperature: float = 0.0,
+    do_sample: bool = False,
+    verbose: bool = True,
+    completion_fn: Callable[[str, list[dict[str, str]]], str] | None = None,
+) -> SingleRolloutDebug:
+    if tokenizer is None:
+        raise ValueError("tokenizer is required")
+    if completion_fn is None and model is None:
+        raise ValueError("model is required when completion_fn is not provided")
+
+    turns: list[dict[str, Any]] = []
+    episode_return = 0.0
+    valid_action_count = 0
+    invalid_action_count = 0
+
+    with _open_env(env_url) as env:
+        result = env.reset(seed=seed, scenario_variant=scenario_variant)
+        for turn in range(max_turns):
+            if result.done:
+                break
+
+            prompt_text = observation_to_prompt(result.observation, dataset_prompt)
+            messages, rendered_prompt = _render_prompt(tokenizer, prompt_text, system_prompt)
+            completion_text = (
+                completion_fn(rendered_prompt, messages)
+                if completion_fn is not None
+                else _generate_debug_completion(
+                    model=model,
+                    tokenizer=tokenizer,
+                    rendered_prompt=rendered_prompt,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    do_sample=do_sample,
+                )
+            )
+
+            action, is_valid = parse_action(completion_text)
+            step_result = env.step(action)
+            reward = float(step_result.reward or 0.0)
+            metadata = dict(getattr(step_result.observation, "metadata", {}) or {})
+            episode_return += reward
+            if is_valid:
+                valid_action_count += 1
+            else:
+                invalid_action_count += 1
+
+            turn_record = {
+                "turn": turn,
+                "scenario_variant": scenario_variant,
+                "raw_completion": completion_text,
+                "parsed_action": action.model_dump(exclude_none=True),
+                "is_valid_action": is_valid,
+                "reward": reward,
+                "done": step_result.done,
+                "env_error": metadata.get("error"),
+                "metadata": metadata,
+                "observation_summary": {
+                    "tick": step_result.observation.current_tick,
+                    "budget_remaining": step_result.observation.budget_remaining,
+                    "market_price": step_result.observation.market_price,
+                    "free_gpus": step_result.observation.free_gpus,
+                    "owned_gpus": step_result.observation.owned_gpus,
+                    "idle_owned_gpus": step_result.observation.idle_owned_gpus,
+                },
+            }
+            turns.append(turn_record)
+
+            if verbose:
+                print(f"TURN {turn}")
+                print(f"completion: {completion_text!r}")
+                print(f"parsed_action: {turn_record['parsed_action']}")
+                print(
+                    f"valid={is_valid} reward={reward:.2f} done={step_result.done} "
+                    f"env_error={metadata.get('error')!r}"
+                )
+                print(f"observation: {turn_record['observation_summary']}")
+                print()
+
+            result = step_result
+
+    return SingleRolloutDebug(
+        seed=seed,
+        scenario_variant=scenario_variant,
+        episode_return=round(episode_return, 2),
+        valid_action_count=valid_action_count,
+        invalid_action_count=invalid_action_count,
+        final_done=result.done,
+        turns=turns,
+    )
     try:
         payload = json.loads(match.group(0))
         return ComputeMarketAction(**payload), True
@@ -105,16 +312,7 @@ def rollout_once(
             break
 
         prompt_text = observation_to_prompt(result.observation, dataset_prompt)
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt_text},
-        ]
-        rendered_prompt = tokenizer.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-            tokenize=False,
-            enable_thinking=False,
-        )
+        _, rendered_prompt = _render_prompt(tokenizer, prompt_text, system_prompt)
 
         rollout_outputs = generate_rollout_completions(trainer, [rendered_prompt])[0]
         prompt_ids.extend(rollout_outputs["prompt_ids"])
@@ -173,7 +371,6 @@ def rollout_func(
     if tokenizer is None:
         raise ValueError("tokenizer is required")
 
-    env_url = env_url or os.environ.get("OPENENV_URL", "http://localhost:8000")
     episode_prompt_ids = []
     episode_completion_ids = []
     episode_logprobs = []
@@ -182,7 +379,7 @@ def rollout_func(
     completion_bonuses = []
     transcripts = []
 
-    with ComputeMarketEnv(base_url=env_url) as env:
+    with _open_env(env_url) as env:
         for idx, prompt_text in enumerate(prompts):
             episode = rollout_once(
                 trainer=trainer,
@@ -306,8 +503,18 @@ def build_trainer(
     )
 
 
-def build_colab_setup_snippet(space_repo_id: str = "openenv-community/compute_market_env") -> str:
-    return f"""# Colab install\n!pip install --upgrade uv\n!uv pip install unsloth vllm --torch-backend=auto\n!uv pip install --upgrade --no-cache-dir --no-deps unsloth unsloth_zoo\n!uv pip install transformers==4.56.2 'trl>=0.24.0' datasets openenv-core\n!pip install git+https://huggingface.co/spaces/{space_repo_id}\n\nimport os\nos.environ['OPENENV_URL'] = 'https://{space_repo_id.replace('/', '-').replace('_', '-')}.hf.space'\n"""
+def build_colab_setup_snippet() -> str:
+    return """# Colab install
+!pip install --upgrade uv
+!uv pip install unsloth vllm --torch-backend=auto
+!uv pip install --upgrade --no-cache-dir --no-deps unsloth unsloth_zoo
+!uv pip install transformers==4.56.2 'trl>=0.24.0' datasets openenv-core
+!git clone https://github.com/kiankyars/lambdatheta.git
+
+import os, sys
+sys.path.append('/content/lambdatheta')
+os.environ['OPENENV_URL'] = 'local'
+"""
 
 
 if __name__ == "__main__":

@@ -84,15 +84,15 @@ class ComputeMarketEnvironment(
         self._budget_remaining = initial_budget
         self._cumulative_reward = 0.0
         self._done = False
+        self._initialize_episode(default_seed, episode_id=self._state.episode_id)
 
-    def reset(
+    def _initialize_episode(
         self,
-        seed: int | None = None,
+        scenario_seed: int,
         episode_id: str | None = None,
-        **kwargs,
-    ) -> ComputeMarketObservation:
-        scenario_seed = self.default_seed if seed is None else seed
-        self._apply_scenario_variant(kwargs.get("scenario_variant", "baseline"))
+        scenario_variant: str = "baseline",
+    ) -> None:
+        self._apply_scenario_variant(scenario_variant)
         self._rng = random.Random(scenario_seed)
         self._current_tick = 0
         self._done = False
@@ -115,6 +115,19 @@ class ComputeMarketEnvironment(
             episode_id=episode_id or str(uuid4()),
             step_count=0,
             scenario_seed=scenario_seed,
+        )
+
+    def reset(
+        self,
+        seed: int | None = None,
+        episode_id: str | None = None,
+        **kwargs,
+    ) -> ComputeMarketObservation:
+        scenario_seed = self.default_seed if seed is None else seed
+        self._initialize_episode(
+            scenario_seed,
+            episode_id=episode_id,
+            scenario_variant=kwargs.get("scenario_variant", "baseline"),
         )
         return self._build_observation(
             0.0,

@@ -14,6 +14,25 @@ def test_reset_is_deterministic_for_fixed_seed():
     ]
 
 
+def test_initial_state_is_populated_before_explicit_reset():
+    env = ComputeMarketEnvironment(default_seed=3)
+
+    assert env.state.current_tick == 0
+    assert env.state.market_price > 0
+    assert len(env.state.jobs) > 0
+    assert len(env.state.actor_signals) > 0
+
+
+def test_step_before_explicit_reset_uses_initialized_state():
+    env = ComputeMarketEnvironment(default_seed=3)
+
+    result = env.step(ComputeMarketAction(action_type="noop"))
+
+    assert result.current_tick == 1
+    assert len(result.jobs) > 0
+    assert result.market_price > 0
+
+
 def test_bid_schedule_and_complete_job():
     env = ComputeMarketEnvironment(total_gpus=12, initial_budget=200.0, max_ticks=8, default_seed=0)
     env.reset(seed=3)
